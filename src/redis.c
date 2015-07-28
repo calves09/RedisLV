@@ -275,6 +275,9 @@ struct redisCommand redisCommandTable[] = {
     {"pfmerge",pfmergeCommand,-2,"wm",0,NULL,1,-1,1,0,0},
     {"pfdebug",pfdebugCommand,-3,"w",0,NULL,0,0,0,0,0},
     {"latency",latencyCommand,-2,"arslt",0,NULL,0,0,0,0,0},
+    {"freeze",freezeCommand,-2,"w",0,NULL,1,-1,1,0,0},
+    {"melt",meltCommand,-2,"w",0,NULL,1,-1,1,0,0},
+    {"freezed",freezedCommand,2,"rS",0,NULL,0,0,0,0,0},
     {"backup",backupCommand,2,"ar",0,NULL,0,0,0,0,0}
 };
 
@@ -502,6 +505,16 @@ unsigned int dictEncObjHash(const void *key) {
     }
 }
 
+/* Freezed key hash table */
+dictType freezedDictType = {
+    dictSdsHash,                /* hash function */
+    NULL,                       /* key dup */
+    NULL,                       /* val dup */
+    dictSdsKeyCompare,          /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    NULL                        /* val destructor */
+};
+
 /* Sets type hash table */
 dictType setDictType = {
     dictEncObjHash,            /* hash function */
@@ -612,6 +625,8 @@ void tryResizeHashTables(int dbid) {
         dictResize(server.db[dbid].dict);
     if (htNeedsResize(server.db[dbid].expires))
         dictResize(server.db[dbid].expires);
+    if (htNeedsResize(server.db[dbid].freezed))
+        dictResize(server.db[dbid].freezed);
 }
 
 /* Our hash table implementation performs rehashing incrementally while
@@ -630,6 +645,11 @@ int incrementallyRehash(int dbid) {
     /* Expires */
     if (dictIsRehashing(server.db[dbid].expires)) {
         dictRehashMilliseconds(server.db[dbid].expires,1);
+        return 1; /* already used our millisecond for this loop... */
+    }
+    /* Freezed */
+    if (dictIsRehashing(server.db[dbid].freezed)) {
+        dictRehashMilliseconds(server.db[dbid].freezed,1);
         return 1; /* already used our millisecond for this loop... */
     }
     return 0;
@@ -1268,6 +1288,8 @@ void createSharedObjects(void) {
     shared.space = createObject(REDIS_STRING,sdsnew(" "));
     shared.colon = createObject(REDIS_STRING,sdsnew(":"));
     shared.plus = createObject(REDIS_STRING,sdsnew("+"));
+    shared.keyfreezederr = createObject(REDIS_STRING,sdsnew(
+        "-WKEYFREEZED Operation on a freezed key, pleasse melt it first.\r\n"));
 
     for (j = 0; j < REDIS_SHARED_SELECT_CMDS; j++) {
         char dictid_str[64];
@@ -1709,6 +1731,7 @@ void initServer(void) {
         server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].id = j;
         server.db[j].avg_ttl = 0;
+        server.db[j].freezed = dictCreate(&freezedDictType,NULL);
     }
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
@@ -2880,6 +2903,14 @@ sds genRedisInfoString(char *section) {
       info = sdscatprintf(info, "# leveldb\r\n");
       if(server.leveldb_state != REDIS_LEVELDB_OFF) {
         info = sdscatprintf(info, "leveldb op num=%lld\r\n", server.leveldb_op_num);
+        for (j = 0; j < server.dbnum; j++) {
+            long long keys;
+
+            keys = dictSize(server.db[j].freezed);
+            if (keys) {
+                info = sdscatprintf(info, "db%d:freezed=%lld\r\n", j, keys);
+            }
+        }
         char *ss = leveldb_property_value(server.ldb.db, "leveldb.stats");
         info = sdscat(info,ss);
         leveldb_free(ss);

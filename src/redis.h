@@ -438,6 +438,7 @@ typedef struct redisDb {
     dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
     int id;
     long long avg_ttl;          /* Average TTL, just for stats */
+    dict *freezed;              /* The keyspace for freezed key for this db */
 } redisDb;
 
 /* Client MULTI/EXEC state */
@@ -538,7 +539,7 @@ struct sharedObjectsStruct {
     *emptymultibulk, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr,
     *outofrangeerr, *noscripterr, *loadingerr, *slowscripterr, *bgsaveerr,
     *masterdownerr, *roslaveerr, *execaborterr, *noautherr, *noreplicaserr,
-    *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk,
+    *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk, *keyfreezederr,
     *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *rpop, *lpop,
     *lpush, *emptyscan, *minstring, *maxstring,
     *select[REDIS_SHARED_SELECT_CMDS],
@@ -606,6 +607,7 @@ struct leveldb {
   leveldb_options_t *options;
   leveldb_readoptions_t *roptions;
   leveldb_writeoptions_t *woptions;
+  struct redisClient *fakeClient;
 };
 
 /*-----------------------------------------------------------------------------
@@ -943,6 +945,7 @@ typedef struct {
 
 extern struct redisServer server;
 extern struct sharedObjectsStruct shared;
+extern dictType freezedDictType;
 extern dictType setDictType;
 extern dictType zsetDictType;
 extern dictType dbDictType;
@@ -1450,10 +1453,14 @@ void pfmergeCommand(redisClient *c);
 void pfdebugCommand(redisClient *c);
 void latencyCommand(redisClient *c);
 void backupCommand(redisClient *c);
+void freezeCommand(redisClient *c);
+void meltCommand(redisClient *c);
+void freezedCommand(redisClient *c);
 
 int loadleveldb(char *path);
 void closeleveldb(struct leveldb *ldb);
 void backupleveldb(void *arg);
+int isKeyFreezed(int dbid, robj *key);
 
 void leveldbHset(int dbid, struct leveldb *ldb, robj** argv);
 void leveldbHsetDirect(int dbid, struct leveldb *ldb, robj *argv1, robj *argv2, robj *argv3);

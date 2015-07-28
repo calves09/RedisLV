@@ -253,8 +253,13 @@ void saddCommand(redisClient *c) {
 
     set = lookupKeyWrite(c->db,c->argv[1]);
     if (set == NULL) {
-        set = setTypeCreate(c->argv[2]);
-        dbAdd(c->db,c->argv[1],set);
+        if(isKeyFreezed(c->db->id, c->argv[1]) == 1) {
+            addReply(c,shared.keyfreezederr);
+            return;
+        } else {
+            set = setTypeCreate(c->argv[2]);
+            dbAdd(c->db,c->argv[1],set);
+        }
     } else {
         if (set->type != REDIS_SET) {
             addReply(c,shared.wrongtypeerr);
@@ -324,7 +329,7 @@ void smoveCommand(redisClient *c) {
         addReply(c,shared.cone);
         return;
     }
-
+    
     /* If the element cannot be removed from the src set, return 0. */
     if (!setTypeRemove(srcset,ele)) {
         addReply(c,shared.czero);

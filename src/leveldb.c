@@ -30,6 +30,240 @@ void initleveldb(struct leveldb* ldb, char *path) {
   leveldb_writeoptions_set_sync(ldb->woptions, 0);
 }
 
+int addFreezedKey(int dbid, sds key, char keytype) {
+    dictEntry *entry = dictAddRaw(server.db[dbid].freezed,key);
+
+    if (!entry) return REDIS_ERR;
+    dictSetSignedIntegerVal(entry, keytype);
+    return REDIS_OK;
+}
+
+int loadFreezedKey(struct leveldb* ldb) {
+    int success = REDIS_OK;
+    int dbid = 0;
+    unsigned long len = 0;
+    char *data = NULL;
+    char *value = NULL;
+    size_t dataLen = 0;
+    size_t valueLen = 0;
+    sds strkey;
+    int retval;
+    leveldb_iterator_t *iterator = leveldb_create_iterator(ldb->db, ldb->roptions);
+    char tmp[LEVELDB_KEY_FLAG_SET_KEY_LEN];
+
+    tmp[LEVELDB_KEY_FLAG_TYPE] = 'f';
+    for(dbid = 0; dbid < server.dbnum; dbid++) {
+        tmp[LEVELDB_KEY_FLAG_DATABASE_ID] = dbid;
+        
+        for(leveldb_iter_seek(iterator, tmp, LEVELDB_KEY_FLAG_SET_KEY_LEN); leveldb_iter_valid(iterator); leveldb_iter_next(iterator)) {
+            data = (char*) leveldb_iter_key(iterator, &dataLen);
+            if(data[LEVELDB_KEY_FLAG_DATABASE_ID] != dbid || data[LEVELDB_KEY_FLAG_TYPE] != 'f') break;
+
+            value = (char*) leveldb_iter_value(iterator, &valueLen);
+            if(valueLen != 1) continue;
+            
+            len = data[LEVELDB_KEY_FLAG_SET_KEY_LEN];
+            strkey = sdsnewlen(data+LEVELDB_KEY_FLAG_SET_KEY,len);
+            retval = addFreezedKey(dbid, strkey, value[0]);
+            redisAssertWithInfo(NULL,NULL,retval == REDIS_OK);
+        }
+    }
+    
+    char *err = NULL;
+    leveldb_iter_get_error(iterator, &err);
+    if(err != NULL) {
+        redisLog(REDIS_WARNING, "load freezedkey iterator err: %s", err);
+        leveldb_free(err);
+        success = REDIS_ERR;
+        err = NULL;
+    }
+
+    leveldb_iter_destroy(iterator);
+    return success;
+}
+
+int isKeyFreezed(int dbid, robj *key) {
+    dictEntry *de = dictFind(server.db[dbid].freezed,key->ptr);
+		return de ? 1 : 0;
+}
+
+sds createleveldbFreezedKeyHead(int dbid, sds name) {
+  char tmp[LEVELDB_KEY_FLAG_SET_KEY];
+
+  tmp[LEVELDB_KEY_FLAG_DATABASE_ID] = dbid;
+  tmp[LEVELDB_KEY_FLAG_TYPE] = 'f';
+  tmp[LEVELDB_KEY_FLAG_SET_KEY_LEN] = sdslen(name);
+
+  sds key = sdsnewlen(tmp, LEVELDB_KEY_FLAG_SET_KEY);
+
+  key = sdscatsds(key, name);
+  return key;
+}
+
+int freezeKey(redisDb *db, struct leveldb *ldb, robj *key, char keytype) {
+    sds strkey;
+    sds leveldbkey;
+    int retval;
+    char *err = NULL;
+    
+    if (!dbDelete(db, key)) {
+	    return REDIS_ERR;
+    }
+
+    leveldbkey = createleveldbFreezedKeyHead(db->id, key->ptr);
+    leveldb_put(ldb->db, ldb->woptions, leveldbkey, sdslen(leveldbkey), &keytype, 1, &err);
+    if (err != NULL) {
+        redisLog(REDIS_WARNING, "freezekey err: %s", err);
+        leveldb_free(err);
+        sdsfree(leveldbkey);
+        err = NULL;
+        return REDIS_ERR;
+    }
+    server.leveldb_op_num++;
+    sdsfree(leveldbkey);
+    
+    strkey = sdsdup(key->ptr);
+    retval = addFreezedKey(db->id, strkey, keytype);
+    redisAssertWithInfo(NULL,key,retval == REDIS_OK);
+    if(retval != REDIS_OK)
+    {
+        sdsfree(strkey);
+        return REDIS_ERR;
+    }
+    
+    return REDIS_OK;
+}
+
+int callCommandForleveldb(struct redisClient *fakeClient, char *data, size_t dataLen, leveldb_iterator_t *iterator) {
+    char *value = NULL;
+    size_t valueLen = 0;
+    int argc;
+    unsigned long len;
+    robj **argv;
+    struct redisCommand *cmd;
+    int tmptype;
+
+    tmptype = data[LEVELDB_KEY_FLAG_TYPE];
+    if(tmptype == 'h'){
+        argc = 4;
+        argv = zmalloc(sizeof(robj*)*argc);
+        fakeClient->argc = argc;
+        fakeClient->argv = argv;
+        argv[0] = createStringObject("hset",4);
+        len = data[LEVELDB_KEY_FLAG_SET_KEY_LEN];
+        argv[1] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY,len);
+        argv[2] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY+len+1,dataLen-LEVELDB_KEY_FLAG_SET_KEY-len-1);
+        value = (char*) leveldb_iter_value(iterator, &valueLen);
+        argv[3] = createStringObject(value, valueLen);
+    }else if(tmptype == 's'){
+        argc = 3;
+        argv = zmalloc(sizeof(robj*)*argc);
+        fakeClient->argc = argc;
+        fakeClient->argv = argv;
+        argv[0] = createStringObject("sadd",4);
+        len = data[LEVELDB_KEY_FLAG_SET_KEY_LEN];
+        argv[1] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY,len);
+        argv[2] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY+len+1,dataLen-LEVELDB_KEY_FLAG_SET_KEY-len-1);
+    }else if(tmptype == 'z'){
+        argc = 4;
+        argv = zmalloc(sizeof(robj*)*argc);
+        fakeClient->argc = argc;
+        fakeClient->argv = argv;
+        argv[0] = createStringObject("zadd",4);
+        len = data[LEVELDB_KEY_FLAG_SET_KEY_LEN];
+        argv[1] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY,len);
+        argv[3] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY+len+1,dataLen-LEVELDB_KEY_FLAG_SET_KEY-len-1);
+        value = (char*) leveldb_iter_value(iterator, &valueLen);
+        argv[2] = createStringObject(value, valueLen);
+    }else{
+        redisLog(REDIS_WARNING,"callCommandForLeveldb no found type: %d %d", fakeClient->db->id, tmptype);
+        freeFakeClientArgv(fakeClient);
+        return REDIS_ERR;
+    }
+
+    cmd = lookupCommand(argv[0]->ptr);
+    if (!cmd) {
+        redisLog(REDIS_WARNING,"Unknown command '%s' from leveldb", (char*)argv[0]->ptr);
+        exit(1);
+    }
+    cmd->proc(fakeClient);
+
+    /* The fake client should not have a reply */
+    redisAssert(fakeClient->bufpos == 0 && listLength(fakeClient->reply) == 0);
+    /* Clean up. Command code may have changed argv/argc so we use the
+     * argv/argc of the client instead of the local variables. */
+    freeFakeClientArgv(fakeClient);
+    
+    return REDIS_OK;
+}
+
+int meltKey(int dbid, struct leveldb *ldb, robj *key, char keytype) {
+    int success = 1;
+    char *data = NULL;
+    size_t dataLen = 0;
+    size_t keylen = sdslen(key->ptr);
+    sds leveldbkey;
+    sds sdskey;
+    char *err = NULL;
+    struct redisClient *fakeClient = ldb->fakeClient;
+
+    if(selectDb(fakeClient,dbid) == REDIS_ERR) {
+        redisLog(REDIS_WARNING, "meltKey select db error: %d", dbid);
+        return REDIS_ERR;
+    }
+    
+    leveldbkey = createleveldbFreezedKeyHead(dbid, key->ptr);
+    leveldb_delete(ldb->db, ldb->woptions, leveldbkey, sdslen(leveldbkey), &err);
+    if (err != NULL) {
+        redisLog(REDIS_WARNING, "meltKey leveldb err: %s", err);
+        leveldb_free(err); 
+				sdsfree(leveldbkey);
+        err = NULL;
+        return REDIS_ERR;
+    }
+    sdsfree(leveldbkey);
+    server.leveldb_op_num++;
+    
+    dictDelete(server.db[dbid].freezed,key->ptr);
+
+    char tmp[LEVELDB_KEY_FLAG_SET_KEY];
+    tmp[LEVELDB_KEY_FLAG_DATABASE_ID] = dbid;
+    tmp[LEVELDB_KEY_FLAG_TYPE] = keytype;
+    tmp[LEVELDB_KEY_FLAG_SET_KEY_LEN] = keylen;
+    sdskey = sdsnewlen(tmp, LEVELDB_KEY_FLAG_SET_KEY);
+    sdskey = sdscatsds(sdskey, key->ptr);
+    
+    leveldb_iterator_t *iterator = leveldb_create_iterator(ldb->db, ldb->roptions);
+    for(leveldb_iter_seek(iterator, sdskey, sdslen(sdskey)); leveldb_iter_valid(iterator); leveldb_iter_next(iterator)) {
+        data = (char*) leveldb_iter_key(iterator, &dataLen);
+        if(data[LEVELDB_KEY_FLAG_SET_KEY_LEN] != (char)keylen) break;
+        if(data[LEVELDB_KEY_FLAG_DATABASE_ID] != dbid) break;
+        if(memcmp(key->ptr, data + LEVELDB_KEY_FLAG_SET_KEY, keylen) != 0) break;
+        
+        if (callCommandForleveldb(fakeClient, data, dataLen, iterator) == REDIS_OK) {
+            server.dirty++;
+        } else {
+            success = 0;
+            break;
+        }
+    }
+    
+    sdsfree(sdskey);
+    
+    leveldb_iter_get_error(iterator, &err);
+    if(err != NULL) {
+        redisLog(REDIS_WARNING, "meltKey iterator err: %s", err);
+        leveldb_free(err);
+        err = NULL;
+    }
+
+    leveldb_iter_destroy(iterator);
+    if(success == 1) {
+        return REDIS_OK;
+    }
+    return REDIS_ERR;
+}
+
 int loadleveldb(char *path) {
   redisLog(REDIS_NOTICE, "load leveldb path: %s", path);
 
@@ -39,22 +273,25 @@ int loadleveldb(char *path) {
 
   server.leveldb_state = REDIS_LEVELDB_OFF;
   initleveldb(&server.ldb, path);
+  server.ldb.fakeClient = fakeClient;
+  
+  if(loadFreezedKey(&server.ldb) == REDIS_ERR) {
+    server.leveldb_state = old_leveldb_state;
+    return REDIS_ERR;
+  }
+  
   startLoading(NULL);
 
   int success = 1;
   int dbid = 0;
   char *data = NULL;
-  char *value = NULL;
   size_t dataLen = 0;
-  size_t valueLen = 0;
-  int tmpdbid, tmptype;
+  int tmpdbid;
   leveldb_iterator_t *iterator = leveldb_create_iterator(server.ldb.db, server.ldb.roptions);
 
   for(leveldb_iter_seek_to_first(iterator); leveldb_iter_valid(iterator); leveldb_iter_next(iterator)) {
-    int argc;
     unsigned long len;
-    robj **argv;
-    struct redisCommand *cmd;
+    robj *tmpkey;
 
     if (!(loops++ % 1000000)) {
       processEventsWhileBlocked();
@@ -62,7 +299,6 @@ int loadleveldb(char *path) {
     }
     data = (char*) leveldb_iter_key(iterator, &dataLen);
     tmpdbid = data[LEVELDB_KEY_FLAG_DATABASE_ID];
-    tmptype = data[LEVELDB_KEY_FLAG_TYPE];
     if(tmpdbid != dbid) {
       if(selectDb(fakeClient,tmpdbid) == REDIS_OK ){
         dbid = tmpdbid;
@@ -72,59 +308,22 @@ int loadleveldb(char *path) {
         break;
       }
     }
-    if(tmptype == 'h'){
-      argc = 4;
-      argv = zmalloc(sizeof(robj*)*argc);
-      fakeClient->argc = argc;
-      fakeClient->argv = argv;
-      argv[0] = createStringObject("hset",4);
-      len = data[LEVELDB_KEY_FLAG_SET_KEY_LEN];
-      argv[1] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY,len);
-      argv[2] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY+len+1,dataLen-LEVELDB_KEY_FLAG_SET_KEY-len-1);
-      value = (char*) leveldb_iter_value(iterator, &valueLen);
-      argv[3] = createStringObject(value, valueLen);
-    }else if(tmptype == 's'){
-      argc = 3;
-      argv = zmalloc(sizeof(robj*)*argc);
-      fakeClient->argc = argc;
-      fakeClient->argv = argv;
-      argv[0] = createStringObject("sadd",4);
-      len = data[LEVELDB_KEY_FLAG_SET_KEY_LEN];
-      argv[1] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY,len);
-      argv[2] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY+len+1,dataLen-LEVELDB_KEY_FLAG_SET_KEY-len-1);
-    }else if(tmptype == 'z'){
-      argc = 4;
-      argv = zmalloc(sizeof(robj*)*argc);
-      fakeClient->argc = argc;
-      fakeClient->argv = argv;
-      argv[0] = createStringObject("zadd",4);
-      len = data[LEVELDB_KEY_FLAG_SET_KEY_LEN];
-      argv[1] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY,len);
-      argv[3] = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY+len+1,dataLen-LEVELDB_KEY_FLAG_SET_KEY-len-1);
-      value = (char*) leveldb_iter_value(iterator, &valueLen);
-      argv[2] = createStringObject(value, valueLen);
-    }else{
-      redisLog(REDIS_WARNING,"load leveldb no found type: %d %d", dbid, tmptype);
-      freeFakeClientArgv(fakeClient);
+    
+    len = data[LEVELDB_KEY_FLAG_SET_KEY_LEN];
+    tmpkey = createStringObject(data+LEVELDB_KEY_FLAG_SET_KEY,len);
+    if(isKeyFreezed(dbid, tmpkey) == 1) {
+      decrRefCount(tmpkey);
+      continue;
+    }
+    decrRefCount(tmpkey);
+    
+    if (callCommandForleveldb(fakeClient, data, dataLen, iterator) == REDIS_ERR) {
       success = 0;
       break;
     }
-    cmd = lookupCommand(argv[0]->ptr);
-    if (!cmd) {
-      redisLog(REDIS_WARNING,"Unknown command '%s' from leveldb", (char*)argv[0]->ptr);
-      exit(1);
-    }
-    cmd->proc(fakeClient);
-
-    /* The fake client should not have a reply */
-    redisAssert(fakeClient->bufpos == 0 && listLength(fakeClient->reply) == 0);
-    /* Clean up. Command code may have changed argv/argc so we use the
-     * argv/argc of the client instead of the local variables. */
-    freeFakeClientArgv(fakeClient);
   }
   redisLog(REDIS_NOTICE, "load leveldb sum: %lu", loops);
 
-  freeFakeClient(fakeClient);
   stopLoading();
   server.leveldb_state = old_leveldb_state;
 
@@ -148,6 +347,7 @@ void closeleveldb(struct leveldb *ldb) {
   leveldb_readoptions_destroy(ldb->roptions);
   leveldb_options_destroy(ldb->options);
   leveldb_close(ldb->db);
+  freeFakeClient(ldb->fakeClient);
 }
 
 sds createleveldbHashHead(int dbid, sds name) {
@@ -838,4 +1038,113 @@ void backupCommand(redisClient *c) {
   path[len] = '\0';
   bioCreateBackgroundJob(REDIS_BIO_LEVELDB_BACKUP,(void*)path,NULL,NULL);
   addReplyStatus(c,"backup leveldb started");
+}
+
+void freezeCommand(redisClient *c) {
+    if(server.leveldb_state == REDIS_LEVELDB_OFF) {
+        addReplyError(c,"leveldb off");
+        return;
+    }
+    
+    int deleted = 0;
+    int j;
+    robj *o;
+    
+    for (j = 1; j < c->argc; j++) {
+        o = lookupKeyRead(c->db,c->argv[j]);
+        if (o != NULL) {
+            if(o->type == REDIS_SET) {
+                if(freezeKey(c->db, &server.ldb, c->argv[j], 's') == REDIS_ERR) {
+                    redisLog(REDIS_WARNING, "freezeCommand freeze set key:%s failed", (char*)c->argv[j]->ptr);
+                    continue;
+                }
+            } else if(o->type == REDIS_ZSET) {
+                if(freezeKey(c->db, &server.ldb, c->argv[j], 'z') == REDIS_ERR) {
+                    redisLog(REDIS_WARNING, "freezeCommand freeze zset key:%s failed", (char*)c->argv[j]->ptr);
+                    continue;
+                }
+            } else if(o->type == REDIS_HASH) {
+                if(freezeKey(c->db, &server.ldb, c->argv[j], 'h') == REDIS_ERR) {
+                    redisLog(REDIS_WARNING, "freezeCommand freeze hash key:%s failed", (char*)c->argv[j]->ptr);
+                    continue;
+                }
+            } else {
+                redisLog(REDIS_WARNING, "freezeCommand keytype not set or zset or hash");
+                continue;
+            }
+            signalModifiedKey(c->db,c->argv[j]);
+            notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",c->argv[j],c->db->id);
+            server.dirty++;
+            deleted++;
+        }
+    }
+    
+    addReplyLongLong(c,deleted);
+}
+
+char getFreezedKeyType(int dbid, robj *key) {
+    dictEntry *de = dictFind(server.db[dbid].freezed,key->ptr);
+
+    if (de) {
+        return (char)(dictGetSignedIntegerVal(de));
+    }
+    return 0;
+}
+
+void meltCommand(redisClient *c) {
+    if(server.leveldb_state == REDIS_LEVELDB_OFF) {
+        addReplyError(c,"leveldb off");
+        return;
+    }
+    
+    int success = 0;
+    int j;
+    
+    for (j = 1; j < c->argc; j++) {
+        if(isKeyFreezed(c->db->id, c->argv[j]) == 1) {
+            if(meltKey(c->db->id, &server.ldb, c->argv[j], getFreezedKeyType(c->db->id, c->argv[j])) == REDIS_OK) {
+                success++;
+            } else {
+                redisLog(REDIS_WARNING, "meltCommand melt key:%s failed", (char*)c->argv[j]->ptr);
+            }
+        }
+    }
+    
+    addReplyLongLong(c,success);
+}
+
+void freezedCommand(redisClient *c) {
+    if(server.leveldb_state == REDIS_LEVELDB_OFF) {
+        addReplyError(c,"leveldb off");
+        return;
+    }
+    
+    dictIterator *di;
+    dictEntry *de;
+    sds pattern = c->argv[1]->ptr;
+    int plen = sdslen(pattern), allkeys;
+    unsigned long numkeys = 0;
+    void *replylen = addDeferredMultiBulkLength(c);
+
+    di = dictGetSafeIterator(c->db->freezed);
+    allkeys = (pattern[0] == '*' && pattern[1] == '\0');
+    while((de = dictNext(di)) != NULL) {
+        sds key = dictGetKey(de);
+        char keytype = (char)(dictGetSignedIntegerVal(de));;
+        robj *keyobj;
+        robj *keyval;
+
+        if (allkeys || stringmatchlen(pattern,plen,key,sdslen(key),0)) {
+            keyobj = createStringObject(key,sdslen(key));
+            keyval = createStringObject(&keytype,1);
+            addReplyBulk(c,keyobj);
+            addReplyBulk(c,keyval);
+            numkeys++;
+            numkeys++;
+            decrRefCount(keyobj);
+            decrRefCount(keyval);
+        }
+    }
+    dictReleaseIterator(di);
+    setDeferredMultiBulkLength(c,replylen,numkeys);
 }

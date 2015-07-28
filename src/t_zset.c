@@ -1239,14 +1239,19 @@ void zaddGenericCommand(redisClient *c, int incr) {
     /* Lookup the key and create the sorted set if does not exist. */
     zobj = lookupKeyWrite(c->db,key);
     if (zobj == NULL) {
-        if (server.zset_max_ziplist_entries == 0 ||
-            server.zset_max_ziplist_value < sdslen(c->argv[3]->ptr))
-        {
-            zobj = createZsetObject();
+        if(isKeyFreezed(c->db->id, key) == 1) {
+            addReply(c,shared.keyfreezederr);
+            goto cleanup;
         } else {
-            zobj = createZsetZiplistObject();
+            if (server.zset_max_ziplist_entries == 0 ||
+                server.zset_max_ziplist_value < sdslen(c->argv[3]->ptr))
+            {
+                zobj = createZsetObject();
+            } else {
+                zobj = createZsetZiplistObject();
+            }
+            dbAdd(c->db,key,zobj);
         }
-        dbAdd(c->db,key,zobj);
     } else {
         if (zobj->type != REDIS_ZSET) {
             addReply(c,shared.wrongtypeerr);
@@ -1913,7 +1918,7 @@ void zunionInterGenericCommand(redisClient *c, robj *dstkey, int op) {
         addReply(c,shared.syntaxerr);
         return;
     }
-
+    
     /* read keys to be used for input */
     src = zcalloc(sizeof(zsetopsrc) * setnum);
     for (i = 0, j = 3; i < setnum; i++, j++) {

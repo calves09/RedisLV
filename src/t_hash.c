@@ -399,8 +399,13 @@ robj *hashTypeCurrentObject(hashTypeIterator *hi, int what) {
 robj *hashTypeLookupWriteOrCreate(redisClient *c, robj *key) {
     robj *o = lookupKeyWrite(c->db,key);
     if (o == NULL) {
-        o = createHashObject();
-        dbAdd(c->db,key,o);
+        if(isKeyFreezed(c->db->id, key) == 1) {
+            addReply(c,shared.keyfreezederr);
+            return NULL;
+        } else {
+            o = createHashObject();
+            dbAdd(c->db,key,o);
+        }
     } else {
         if (o->type != REDIS_HASH) {
             addReply(c,shared.wrongtypeerr);
