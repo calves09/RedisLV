@@ -1148,3 +1148,169 @@ void freezedCommand(redisClient *c) {
     dictReleaseIterator(di);
     setDeferredMultiBulkLength(c,replylen,numkeys);
 }
+
+void leveldbDelHash(int dbid, struct leveldb *ldb, robj* objkey, robj *objval) {
+    hashTypeIterator *hi;
+    sds key = createleveldbHashHead(dbid, objkey->ptr);
+    leveldb_writebatch_t* wb = leveldb_writebatch_create();
+    size_t klen = sdslen(key);
+    char *err = NULL;
+
+    hi = hashTypeInitIterator(objval);
+    while (hashTypeNext(hi) != REDIS_ERR) {
+        if (hi->encoding == REDIS_ENCODING_ZIPLIST) {
+            unsigned char *vstr = NULL;
+            unsigned int vlen = UINT_MAX;
+            long long vll = LLONG_MAX;
+
+            hashTypeCurrentFromZiplist(hi, REDIS_HASH_KEY, &vstr, &vlen, &vll);
+            if (vstr) {
+                key = sdscatlen(key, vstr, vlen);
+                leveldb_writebatch_delete(wb, key, sdslen(key));
+                sdsrange(key, 0, klen - 1);
+            } else {
+                sds sdsll = sdsfromlonglong(vll);
+                key = sdscatsds(key, sdsll);
+                leveldb_writebatch_delete(wb, key, sdslen(key));
+                sdsfree(sdsll);
+                sdsrange(key, 0, klen - 1);
+            }
+        } else if (hi->encoding == REDIS_ENCODING_HT) {
+            robj *value;
+            robj *decval;
+
+            hashTypeCurrentFromHashTable(hi, REDIS_HASH_KEY, &value);
+            decval = getDecodedObject(value);
+            key = sdscat(key, decval->ptr);
+            leveldb_writebatch_delete(wb, key, sdslen(key));
+            sdsrange(key, 0, klen - 1);
+            decrRefCount(decval);
+        } else {
+            redisPanic("leveldbDelHash unknown hash encoding");
+        }
+    }
+
+    leveldb_write(ldb->db, ldb->woptions, wb, &err);
+    if (err != NULL) {
+        redisLog(REDIS_WARNING, "leveldbDelHash leveldb err: %s", err);
+        leveldb_free(err);
+        err = NULL;
+    }
+    server.leveldb_op_num++;
+
+    hashTypeReleaseIterator(hi);
+    leveldb_writebatch_destroy(wb);
+    sdsfree(key);
+}
+
+void leveldbDelSet(int dbid, struct leveldb *ldb, robj* objkey, robj *objval) {
+    setTypeIterator *si;
+    robj *eleobj = NULL;
+    int64_t intobj;
+    int encoding;
+    sds key = createleveldbSetHead(dbid, objkey->ptr);
+    leveldb_writebatch_t* wb = leveldb_writebatch_create();
+    size_t klen = sdslen(key);
+    char *err = NULL;
+    
+    si = setTypeInitIterator(objval);
+    while((encoding = setTypeNext(si, &eleobj, &intobj)) != -1) {
+        if (encoding == REDIS_ENCODING_HT) {
+            robj *decval = getDecodedObject(eleobj);
+            key = sdscat(key, decval->ptr);
+            leveldb_writebatch_delete(wb, key, sdslen(key));
+            sdsrange(key, 0, klen - 1);
+            decrRefCount(decval);
+        } else {
+            sds sdsll = sdsfromlonglong((long long)intobj);
+            key = sdscatsds(key, sdsll);
+            leveldb_writebatch_delete(wb, key, sdslen(key));
+            sdsfree(sdsll);
+            sdsrange(key, 0, klen - 1);
+        }
+    }
+    
+    leveldb_write(ldb->db, ldb->woptions, wb, &err);
+    if (err != NULL) {
+        redisLog(REDIS_WARNING, "leveldbDelSet leveldb err: %s", err);
+        leveldb_free(err);
+        err = NULL;
+    }
+    server.leveldb_op_num++;
+    
+    setTypeReleaseIterator(si);
+    leveldb_writebatch_destroy(wb);
+    sdsfree(key);
+}
+
+void leveldbDelZset(int dbid, struct leveldb *ldb, robj* objkey, robj *objval) {
+    int rangelen = zsetLength(objval);
+    sds key = createleveldbSortedSetHead(dbid, objkey->ptr);
+    leveldb_writebatch_t* wb = leveldb_writebatch_create();
+    size_t klen = sdslen(key);
+    char *err = NULL;
+
+    if (objval->encoding == REDIS_ENCODING_ZIPLIST) {
+        unsigned char *zl = objval->ptr;
+        unsigned char *eptr, *sptr;
+        unsigned char *vstr;
+        unsigned int vlen;
+        long long vlong;
+
+        eptr = ziplistIndex(zl,0);
+
+        redisAssertWithInfo(NULL,objval,eptr != NULL);
+        sptr = ziplistNext(zl,eptr);
+
+        while (rangelen--) {
+            redisAssertWithInfo(NULL,objval,eptr != NULL && sptr != NULL);
+            redisAssertWithInfo(NULL,objval,ziplistGet(eptr,&vstr,&vlen,&vlong));
+            if (vstr == NULL) {
+                sds sdsll = sdsfromlonglong(vlong);
+                key = sdscatsds(key, sdsll);
+                leveldb_writebatch_delete(wb, key, sdslen(key));
+                sdsfree(sdsll);
+                sdsrange(key, 0, klen - 1);
+            } else {
+                key = sdscatlen(key, vstr, vlen);
+                leveldb_writebatch_delete(wb, key, sdslen(key));
+                sdsrange(key, 0, klen - 1);
+            }
+            
+            zzlNext(zl,&eptr,&sptr);
+        }
+    } else if (objval->encoding == REDIS_ENCODING_SKIPLIST) {
+        zset *zs = objval->ptr;
+        zskiplist *zsl = zs->zsl;
+        zskiplistNode *ln;
+        robj *ele;
+        robj *decval;
+
+        ln = zsl->header->level[0].forward;
+
+        while(rangelen--) {
+            redisAssertWithInfo(NULL,objval,ln != NULL);
+            ele = ln->obj;
+            
+            decval = getDecodedObject(ele);
+            key = sdscat(key, decval->ptr);
+            leveldb_writebatch_delete(wb, key, sdslen(key));
+            sdsrange(key, 0, klen - 1);
+            decrRefCount(decval);
+            ln = ln->level[0].forward;
+        }
+    } else {
+        redisPanic("leveldbDelZset unknown sorted set encoding");
+    }
+    
+    leveldb_write(ldb->db, ldb->woptions, wb, &err);
+    if (err != NULL) {
+        redisLog(REDIS_WARNING, "leveldbDelZset leveldb err: %s", err);
+        leveldb_free(err);
+        err = NULL;
+    }
+    server.leveldb_op_num++;
+
+    leveldb_writebatch_destroy(wb);
+    sdsfree(key);
+}

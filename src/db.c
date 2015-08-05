@@ -285,13 +285,16 @@ void delCommand(redisClient *c) {
         if (o != NULL) {
           switch(o->type) {
             case REDIS_SET: 
-              leveldbSclear(c->db->id,&server.ldb, c->argv[j]);
+              //leveldbSclear(c->db->id,&server.ldb, c->argv[j]);
+              leveldbDelSet(c->db->id, &server.ldb, c->argv[j], o);
               break;
             case REDIS_ZSET: 
-              leveldbZclear(c->db->id,&server.ldb, c->argv[j]);
+              //leveldbZclear(c->db->id,&server.ldb, c->argv[j]);
+              leveldbDelZset(c->db->id, &server.ldb, c->argv[j], o);
               break;
             case REDIS_HASH: 
-              leveldbHclear(c->db->id,&server.ldb, c->argv[j]);
+              //leveldbHclear(c->db->id,&server.ldb, c->argv[j]);
+              leveldbDelHash(c->db->id, &server.ldb, c->argv[j], o);
               break;
           }
         }
